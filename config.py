@@ -78,6 +78,17 @@ VIX_EXTREME = 40   # Above: panic/capitulation, flip to mean-reversion calls
 # ── Improvement #5: Vertical spread settings ─────────────────────────────────
 SPREAD_WIDTH_PCT = 0.02   # Short leg strike 2% further OTM than long leg
 
+# ── Improvement #7: Bid-ask spread filter ────────────────────────────────────
+MAX_OPTION_SPREAD_PCT = 0.15   # Skip options with bid-ask spread > 15% of mid
+MAX_OPTION_SPREAD_ABS = 0.10   # Skip options with absolute bid-ask spread > $0.10
+
+# ── Improvement #8: Earnings blackout ────────────────────────────────────────
+EARNINGS_BLACKOUT_DAYS_AFTER = 1  # Also block day-after-earnings (IV crush)
+
+# ── Improvement #9: EMA trend filter ─────────────────────────────────────────
+EMA_TREND_CALL_MIN_SCORE = 3   # Calls require score >= 3 (moderate uptrend)
+EMA_TREND_PUT_MAX_SCORE  = 2   # Puts require score <= 2 (moderate downtrend)
+
 # ── Scan timing ───────────────────────────────────────────────────────────────
 SCAN_INTERVAL_SECONDS    = 60   # Scan for new signals every 60s
 MONITOR_INTERVAL_SECONDS = 30   # Check open positions every 30s

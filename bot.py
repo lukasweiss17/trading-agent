@@ -1,13 +1,18 @@
 """
-bot.py - Alpaca Paper Trading Options Bot  v2.0
+bot.py - Alpaca Paper Trading Options Bot  v2.1
 ================================================
-Improvements over v1:
+v2.0 improvements:
   1. IV Rank filter       — only buy when options are historically cheap (IVR < 35)
   2. Multi-timeframe RSI  — 1-min + 5-min + 15-min must all agree before entry
   3. Trade-window filter  — only trade 10:00-11:30 and 14:00-15:30 ET
   4. VIX regime engine    — 4-state volatility regime with dynamic thresholds
   5. Vertical debit spreads — reduces IV exposure and capital at risk
   6. Trailing take-profit — tiered high-water-mark stops; lets winners run
+
+v2.1 improvements:
+  7. Bid-ask spread filter — skip options with spread > 15% of mid (execution cost)
+  8. Earnings blackout     — block tickers in earnings window to avoid IV crush
+  9. EMA trend filter      — only trade in direction of daily EMA trend (8/21/50)
 
 Usage:
     python bot.py
@@ -28,6 +33,13 @@ import pytz
 import schedule
 import ta
 from loguru import logger
+
+try:
+    import yfinance as yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
+    # Will warn at runtime; earnings filter will be disabled
 
 import config
 
@@ -89,7 +101,7 @@ class AlpacaOptionsBot:
     """
 
     def __init__(self) -> None:
-        logger.info("Alpaca Options Bot v2.0 starting up...")
+        logger.info("Alpaca Options Bot v2.1 starting up...")
 
         # Alpaca clients
         self.trading_client = TradingClient(
@@ -112,6 +124,14 @@ class AlpacaOptionsBot:
         self.open_positions: dict[str, dict] = {}
         self._active_tickers: set[str] = set()
         self._blocked_tickers: set[str] = set()
+
+        # Earnings blackout cache — refreshed once per trading day
+        self._earnings_cache: dict[str, Optional[date]] = {}
+        self._earnings_cache_date: date = date.min
+
+        if not _YF_AVAILABLE:
+            logger.warning("[EARNINGS] yfinance not installed — earnings filter disabled. "
+                           "Run: pip install yfinance")
 
         # Correlation groups — only one position allowed per group
         self._corr_groups: list[set[str]] = [
@@ -691,8 +711,22 @@ class AlpacaOptionsBot:
                     floor * 100,
                 )
 
+                # Expiry-day forced close: if today is expiry date and past 3:30pm ET
+                expiry_close = False
+                try:
+                    # OCC symbol: e.g. SPY260330P00644000 → date part is chars [-15:-9]
+                    date_str = symbol[-15:-9]  # e.g. "260330"
+                    exp_date = date(2000 + int(date_str[:2]), int(date_str[2:4]), int(date_str[4:6]))
+                    et_now = datetime.now(pytz.timezone("America/New_York"))
+                    if exp_date == et_now.date() and et_now.hour >= 15 and et_now.minute >= 30:
+                        expiry_close = True
+                except Exception:
+                    pass
+
                 close_reason: Optional[str] = None
-                if pnl_pct <= floor:
+                if expiry_close:
+                    close_reason = "EXPIRY_CLOSE"
+                elif pnl_pct <= floor:
                     close_reason = "TRAILING_STOP" if floor > -config.STOP_LOSS_PCT else "STOP_LOSS"
 
                 if close_reason:
@@ -759,6 +793,178 @@ class AlpacaOptionsBot:
         self._active_tickers.discard(pos["ticker"])
 
     # -----------------------------------------------------------------------
+    # Improvement #8 — Earnings blackout filter
+    # -----------------------------------------------------------------------
+
+    def _refresh_earnings_cache(self) -> None:
+        """
+        Fetch next earnings date for every ticker once per trading day.
+        Skips gracefully if yfinance is unavailable.
+        """
+        if not _YF_AVAILABLE:
+            return
+        today = date.today()
+        if self._earnings_cache_date == today:
+            return
+        logger.info("[EARNINGS] Refreshing earnings calendar for {} tickers...",
+                    len(config.TICKERS))
+        refreshed = 0
+        for ticker in config.TICKERS:
+            try:
+                cal = yf.Ticker(ticker).calendar
+                earnings_dt = None
+                if cal is not None:
+                    if isinstance(cal, dict):
+                        # Newer yfinance: dict with 'Earnings Date' key
+                        dates = cal.get("Earnings Date")
+                        if dates is not None:
+                            try:
+                                # Can be list of Timestamps or a single Timestamp
+                                if hasattr(dates, "__iter__") and not isinstance(dates, str):
+                                    first = list(dates)[0]
+                                else:
+                                    first = dates
+                                earnings_dt = pd.Timestamp(first).date()
+                            except Exception:
+                                pass
+                    elif hasattr(cal, "loc"):
+                        # Older yfinance: DataFrame
+                        try:
+                            earnings_dt = cal.loc["Earnings Date"].iloc[0].date()
+                        except Exception:
+                            pass
+                self._earnings_cache[ticker] = earnings_dt
+                refreshed += 1
+            except Exception as exc:
+                logger.debug("[EARNINGS] Could not fetch {} earnings: {}", ticker, exc)
+                self._earnings_cache[ticker] = None
+        self._earnings_cache_date = today
+        logger.info("[EARNINGS] Calendar cached ({} tickers). Upcoming: {}",
+                    refreshed,
+                    {t: str(d) for t, d in self._earnings_cache.items() if d is not None})
+
+    def _is_earnings_blackout(self, ticker: str) -> bool:
+        """
+        Return True if ticker should be skipped due to earnings risk:
+          - Earnings fall within the current max holding window
+            (today → today + DTE_MAX + 1 days)
+          - Day-after-earnings: IV crush already happened, dead-vol environment
+        """
+        earnings_dt = self._earnings_cache.get(ticker)
+        if earnings_dt is None:
+            return False  # Unknown → allow (don't over-block)
+        today = date.today()
+        # Block if earnings could occur while we hold the position
+        if today <= earnings_dt <= today + timedelta(days=config.DTE_MAX + 1):
+            logger.info("[EARNINGS] {} blocked — earnings {} within holding window",
+                        ticker, earnings_dt)
+            return True
+        # Block day-after-earnings (IV crush, dead-vol)
+        if earnings_dt == today - timedelta(days=config.EARNINGS_BLACKOUT_DAYS_AFTER):
+            logger.info("[EARNINGS] {} blocked — day-after earnings (IV crush risk)",
+                        ticker)
+            return True
+        return False
+
+    # -----------------------------------------------------------------------
+    # Improvement #7 — Bid-ask spread filter
+    # -----------------------------------------------------------------------
+
+    def _check_option_spread(self, symbol: str) -> tuple[bool, Optional[float]]:
+        """
+        Fetch option quote and validate bid-ask spread quality.
+        Returns (spread_ok, mid_price).
+        Rejects options where spread is wider than MAX_OPTION_SPREAD_PCT of mid
+        or wider than MAX_OPTION_SPREAD_ABS in dollar terms.
+        """
+        try:
+            req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+            quotes = self.option_data.get_option_latest_quote(req)
+            q = quotes.get(symbol)
+            if q is None:
+                return False, None
+            bid = float(q.bid_price)
+            ask = float(q.ask_price)
+            if ask <= 0:
+                return False, None
+            mid = (bid + ask) / 2.0
+            if mid <= 0:
+                return False, None
+            spread = ask - bid
+            spread_pct = spread / mid
+            if spread > config.MAX_OPTION_SPREAD_ABS or spread_pct > config.MAX_OPTION_SPREAD_PCT:
+                logger.info(
+                    "[SPREAD] {} bid={:.2f} ask={:.2f} spread=${:.2f} ({:.0f}%) — too wide, skip",
+                    symbol, bid, ask, spread, spread_pct * 100,
+                )
+                return False, None
+            logger.debug(
+                "[SPREAD] {} bid={:.2f} ask={:.2f} spread=${:.2f} ({:.0f}%) — OK",
+                symbol, bid, ask, spread, spread_pct * 100,
+            )
+            return True, mid
+        except Exception as exc:
+            logger.error("Spread check failed {}: {}", symbol, exc)
+            return False, None
+
+    # -----------------------------------------------------------------------
+    # Improvement #9 — EMA trend filter (daily timeframe)
+    # -----------------------------------------------------------------------
+
+    def _ema_trend_score(self, ticker: str) -> int:
+        """
+        Fetch 52 daily bars and compute EMA alignment score (0–5).
+          5 = strong uptrend  (price above all EMAs, all stacked bullishly)
+          0 = strong downtrend
+        Returns 3 (neutral) if insufficient data, to avoid false blocking.
+        """
+        bars = self._get_bars(ticker, TimeFrame.Day, 52)
+        if bars is None or len(bars) < 25:
+            logger.debug("[EMA] {} insufficient daily bars — returning neutral score", ticker)
+            return 3
+        close = bars["close"]
+        price = float(close.iloc[-1])
+        ema8  = float(close.ewm(span=8,  adjust=False).mean().iloc[-1])
+        ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+        score = int(sum([
+            price > ema8,
+            price > ema21,
+            price > ema50,
+            ema8  > ema21,
+            ema21 > ema50,
+        ]))
+        logger.debug(
+            "[EMA] {} price={:.2f} ema8={:.2f} ema21={:.2f} ema50={:.2f} → score={}/5",
+            ticker, price, ema8, ema21, ema50, score,
+        )
+        return score
+
+    def _ema_trend_filter(self, ticker: str, signal: str, regime_label: str) -> bool:
+        """
+        Return True if signal direction aligns with the daily EMA trend.
+        PANIC regime inverts call logic (mean-reversion into extreme downtrend).
+        """
+        score = self._ema_trend_score(ticker)
+        is_panic = "PANIC" in regime_label
+        if signal == "call":
+            if is_panic:
+                # Mean-reversion calls: want an extreme downtrend (score <= 1)
+                ok = score <= 1
+            else:
+                # Momentum calls: need at least moderate uptrend (score >= 3)
+                ok = score >= config.EMA_TREND_CALL_MIN_SCORE
+        else:  # put
+            # Momentum puts: need at least moderate downtrend (score <= 2)
+            ok = score <= config.EMA_TREND_PUT_MAX_SCORE
+        if not ok:
+            logger.info(
+                "[EMA] {} {} rejected — trend score={}/5 (regime={})",
+                ticker, signal.upper(), score, regime_label,
+            )
+        return ok
+
+    # -----------------------------------------------------------------------
     # Correlation helper
     # -----------------------------------------------------------------------
 
@@ -792,6 +998,9 @@ class AlpacaOptionsBot:
 
         use_spreads = regime.get("use_spreads", False)
 
+        # Improvement #8: refresh earnings calendar once per day
+        self._refresh_earnings_cache()
+
         # Collect and score candidates
         candidates: list[dict] = []
         for ticker in config.TICKERS:
@@ -803,9 +1012,17 @@ class AlpacaOptionsBot:
                 logger.debug("{}: correlated position open — skip", ticker)
                 continue
 
+            # Improvement #8: earnings blackout check (cheap — runs before API calls)
+            if self._is_earnings_blackout(ticker):
+                continue
+
             # Filter #2: multi-timeframe signal
             signal, rsi_1m, vol_mom, price = self.calculate_signal_multi_tf(ticker, regime)
             if signal is None or signal != allowed:
+                continue
+
+            # Improvement #9: EMA trend alignment (daily)
+            if not self._ema_trend_filter(ticker, signal, regime.get("label", "")):
                 continue
 
             # Filter #1: IV rank
@@ -848,7 +1065,10 @@ class AlpacaOptionsBot:
             if long_symbol is None:
                 continue
 
-            long_premium = self.get_option_mid_price(long_symbol)
+            # Improvement #7: bid-ask spread filter (also returns mid price)
+            spread_ok, long_premium = self._check_option_spread(long_symbol)
+            if not spread_ok:
+                continue  # already logged by _check_option_spread
             if long_premium is None or long_premium < config.MIN_PREMIUM:
                 logger.warning("{}: premium {:.2f} < min {:.2f} — skip",
                                long_symbol, long_premium or 0, config.MIN_PREMIUM)
