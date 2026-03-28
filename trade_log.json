@@ -1,0 +1,58 @@
+[
+  {
+    "timestamp": "2026-03-27T17:42:40.320307+00:00",
+    "action": "OPEN",
+    "ticker": "SPY",
+    "symbol": "SPY260330P00644000",
+    "direction": "put",
+    "qty": 1,
+    "entry_price": 9.56,
+    "cost": 956.0,
+    "rsi": 33.45,
+    "vol_momentum": 3.52,
+    "score": 58.31,
+    "order_id": "14ad7d89-3dae-49fa-8a37-ee3eae44f540"
+  },
+  {
+    "timestamp": "2026-03-27T17:42:40.708442+00:00",
+    "action": "OPEN",
+    "ticker": "QQQ",
+    "symbol": "QQQ260330P00573000",
+    "direction": "put",
+    "qty": 1,
+    "entry_price": 10.69,
+    "cost": 1069.0,
+    "rsi": 33.39,
+    "vol_momentum": 3.5,
+    "score": 58.14,
+    "order_id": "a1572566-00fd-48cb-b001-5f368cb50ce3"
+  },
+  {
+    "timestamp": "2026-03-27T18:50:49.185740+00:00",
+    "action": "OPEN",
+    "ticker": "SPY",
+    "symbol": "SPY260330P00644000",
+    "direction": "put",
+    "qty": 1,
+    "entry_price": 10.22,
+    "cost": 1022.0,
+    "rsi": 33.45,
+    "vol_momentum": 3.52,
+    "score": 58.31,
+    "order_id": "816852e3-a9a1-42c3-b29f-6f0c2261ccb1"
+  },
+  {
+    "timestamp": "2026-03-27T18:50:49.592327+00:00",
+    "action": "OPEN",
+    "ticker": "QQQ",
+    "symbol": "QQQ260330P00573000",
+    "direction": "put",
+    "qty": 1,
+    "entry_price": 10.865,
+    "cost": 1086.5,
+    "rsi": 33.39,
+    "vol_momentum": 3.5,
+    "score": 58.14,
+    "order_id": "79d85d83-6a7a-4a37-85c9-cb88463869f9"
+  }
+]
