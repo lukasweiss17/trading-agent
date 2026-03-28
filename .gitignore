@@ -1,0 +1,14 @@
+# Secrets — never commit
+.env
+
+# Runtime data — commit manually when you want agents to analyze
+# trade_log.json
+# roi_tracker.json
+# iv_history.json
+
+# Logs and cache
+trading-bot.log
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
